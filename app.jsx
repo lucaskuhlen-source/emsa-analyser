@@ -1894,6 +1894,21 @@ function ImageOverlay({
 
   const onUp = () => setDrag(null);
 
+  // Keep a handle drag alive even when the cursor leaves the image bounds (e.g. moving a
+  // lane far up/down or a band boundary far left/right). Listeners live on window only
+  // while a drag is active, and releasing anywhere ends it.
+  useEffect(() => {
+    if (!drag) return;
+    const move = (e) => onMove(e);
+    const up = () => onUp();
+    window.addEventListener('mousemove', move);
+    window.addEventListener('mouseup', up);
+    return () => {
+      window.removeEventListener('mousemove', move);
+      window.removeEventListener('mouseup', up);
+    };
+  }, [drag]);
+
   const onDoubleClick = (e) => {
     if (drag) return;
     const p = clientToImg(e);
@@ -1936,9 +1951,6 @@ function ImageOverlay({
       ref={wrapRef}
       className="img-wrap"
       style={{ height: boxH }}
-      onMouseMove={onMove}
-      onMouseUp={onUp}
-      onMouseLeave={onUp}
       onDoubleClick={onDoubleClick}
       title="Double-click empty area to add a lane"
     >
@@ -2393,8 +2405,8 @@ function App() {
 
   // ---- EMSA area: a sub-rectangle of the working image defining the region of interest for
   // quantification. Drawn directly on the (full, straightened) working image, so it's in
-  // working coords. Does NOT crop/zoom the view or rebuild the buffer. Lanes outside the new
-  // area are dropped; bands are kept only if they fall inside. ----
+  // working coords. Does NOT crop/zoom the view or rebuild the buffer, and does NOT alter
+  // existing lanes/bands — it only constrains auto-detect. ----
   const applyEmsaArea = useCallback((rect) => {
     if (!signalData) return;
     const newRoi = {
@@ -2405,16 +2417,7 @@ function App() {
     };
     setRoi(newRoi);
     setToolMode(null);
-    setLanes((ls) =>
-      ls.filter((l) => l.x >= newRoi.x && l.x <= newRoi.x + newRoi.w)
-        .map((l, i) => ({ ...l, label: `L${i + 1}` }))
-    );
-    setBands((b) => {
-      if (!b) return null;
-      const ys = [b.boundY1, b.boundY2, b.freeY1, b.freeY2];
-      const allInside = ys.every((y) => y >= newRoi.y && y <= newRoi.y + newRoi.h);
-      return allInside ? b : null;
-    });
+    // ROI is only an auto-detect aid; existing lanes/bands are intentionally left untouched.
   }, [signalData]);
 
   // ---- Background region: store rect; quant uses it for flat per-pixel subtraction ----
@@ -2622,6 +2625,18 @@ function App() {
     return pts;
   }, [fit, chartPoints, normFit]);
 
+  // Prism-style zero: a no-protein control can't sit on a log axis, so place it one
+  // data-step left of the smallest real concentration and label that tick "0".
+  // Presentation only — the fit and curve are unchanged.
+  const zeroPlot = useMemo(() => {
+    if (!fit) return null;
+    const pos = chartPoints.filter((d) => Number.isFinite(d.x) && d.x > 0).sort((a, b) => a.x - b.x);
+    const zero = chartPoints.find((d) => Number.isFinite(d.x) && d.x === 0);
+    if (!zero || pos.length === 0) return null;
+    const ratio = pos.length >= 2 && pos[1].x > pos[0].x ? pos[1].x / pos[0].x : 10;
+    return { pseudoX: pos[0].x / ratio, y: zero.y, label: zero.label, minPos: pos[0].x };
+  }, [fit, chartPoints]);
+
   const mergedChart = useMemo(() => {
     const span = fit ? Math.max(1e-9, fit.Bmax - fit.bottom) : 1;
     const yT = (y) => (normFit && fit ? (y - fit.bottom) / span : y);
@@ -2630,8 +2645,20 @@ function App() {
       if (!Number.isFinite(p.x) || p.x <= 0) continue;
       pts.push({ x: p.x, y: yT(p.y), label: p.label });
     }
+    if (zeroPlot) pts.push({ x: zeroPlot.pseudoX, y: yT(zeroPlot.y), label: zeroPlot.label });
     return pts.sort((a, b) => a.x - b.x);
-  }, [fitCurve, chartPoints, fit, normFit]);
+  }, [fitCurve, chartPoints, fit, normFit, zeroPlot]);
+
+  // Decade ticks plus the pseudo-zero tick (rendered as "0").
+  const xTicks = useMemo(() => {
+    const xs = mergedChart.map((p) => p.x).filter((x) => Number.isFinite(x) && x > 0);
+    if (!xs.length) return undefined;
+    const minReal = zeroPlot ? zeroPlot.minPos : Math.min(...xs);
+    const maxX = Math.max(...xs);
+    const ticks = [];
+    for (let k = Math.floor(Math.log10(minReal)); k <= Math.ceil(Math.log10(maxX)); k++) ticks.push(Math.pow(10, k));
+    return zeroPlot ? [zeroPlot.pseudoX, ...ticks] : ticks;
+  }, [mergedChart, zeroPlot]);
 
   // ---- Quant table CSV download ----
   const exportCSV = useCallback(() => {
@@ -3785,10 +3812,11 @@ footer.app-footer .fin { font-family: 'Instrument Serif', serif; font-style: ita
                               type="number"
                               dataKey="x"
                               scale="log"
-                              domain={["auto", "auto"]}
+                              domain={[zeroPlot ? zeroPlot.pseudoX / 1.6 : "auto", "auto"]}
+                              ticks={xTicks}
                               tick={{ fontFamily: "JetBrains Mono", fontSize: 11, fill: "var(--ink-2)" }}
                               stroke="var(--ink)"
-                              tickFormatter={(v) => v >= 100 || v < 0.01 ? v.toExponential(0) : v}
+                              tickFormatter={(v) => (zeroPlot && Math.abs(v - zeroPlot.pseudoX) <= zeroPlot.pseudoX * 1e-6) ? "0" : (v >= 100 || v < 0.01 ? v.toExponential(0) : v)}
                               label={{
                                 value: `[Protein] (${concUnit})`,
                                 position: "insideBottom",
@@ -3810,7 +3838,7 @@ footer.app-footer .fin { font-family: 'Instrument Serif', serif; font-style: ita
                             <Tooltip
                               contentStyle={{ background: "var(--paper)", border: "1px solid var(--ink)", fontFamily: "JetBrains Mono", fontSize: 12, color: "var(--ink)" }}
                               formatter={(v, name) => [Number.isFinite(v) ? v.toFixed(4) : v, name === "fit" ? "model" : "f bound"]}
-                              labelFormatter={(v) => `[P] = ${Number.isFinite(v) ? v.toPrecision(3) : v} ${concUnit}`}
+                              labelFormatter={(v) => (zeroPlot && Math.abs(v - zeroPlot.pseudoX) <= zeroPlot.pseudoX * 1e-6) ? `[P] = 0 ${concUnit}` : `[P] = ${Number.isFinite(v) ? v.toPrecision(3) : v} ${concUnit}`}
                             />
                             <ReferenceLine
                               x={fit.Kd}
@@ -3845,7 +3873,7 @@ footer.app-footer .fin { font-family: 'Instrument Serif', serif; font-style: ita
                         {normFit
                           ? `Normalised specific binding (f − baseline)/(top − baseline) · baseline = ${fmt(fit.bottom, 3)}, top = ${fmt(fit.Bmax, 3)} · Kd unaffected by normalisation`
                           : `Raw fraction bound · fitted baseline = ${fmt(fit.bottom, 3)} at [P]=0 · top constrained ≤ 1`}
-                        {" · "}Nelder–Mead fit · log X · zero-protein control excluded from plot, included in fit
+                        {" · "}Nelder–Mead fit · log X · zero-protein control shown at left (0), included in fit
                       </div>
                     </div>
                   )}
@@ -3864,5 +3892,5 @@ footer.app-footer .fin { font-family: 'Instrument Serif', serif; font-style: ita
   );
 }
 
-// ---- standalone mount (deploy only; not part of the component) ----
+// ---- standalone mount (deploy only) ----
 createRoot(document.getElementById("root")).render(<App />);
