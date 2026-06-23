@@ -2633,8 +2633,11 @@ function App() {
     const pos = chartPoints.filter((d) => Number.isFinite(d.x) && d.x > 0).sort((a, b) => a.x - b.x);
     const zero = chartPoints.find((d) => Number.isFinite(d.x) && d.x === 0);
     if (!zero || pos.length === 0) return null;
-    const ratio = pos.length >= 2 && pos[1].x > pos[0].x ? pos[1].x / pos[0].x : 10;
-    return { pseudoX: pos[0].x / ratio, y: zero.y, label: zero.label, minPos: pos[0].x };
+    const minPos = pos[0].x;
+    // Anchor the "0" marker one full decade below the smallest decade tick so it
+    // sits on the log grid cleanly and never distorts decade tick spacing.
+    const pseudoX = Math.pow(10, Math.floor(Math.log10(minPos)) - 1);
+    return { pseudoX, y: zero.y, label: zero.label, minPos };
   }, [fit, chartPoints]);
 
   const mergedChart = useMemo(() => {
@@ -2649,16 +2652,18 @@ function App() {
     return pts.sort((a, b) => a.x - b.x);
   }, [fitCurve, chartPoints, fit, normFit, zeroPlot]);
 
-  // Decade ticks plus the pseudo-zero tick (rendered as "0").
+  // Clean decade ticks across the real data range, plus the decorative "0" tick.
   const xTicks = useMemo(() => {
-    const xs = mergedChart.map((p) => p.x).filter((x) => Number.isFinite(x) && x > 0);
+    const xs = chartPoints.map((p) => p.x).filter((x) => Number.isFinite(x) && x > 0);
     if (!xs.length) return undefined;
-    const minReal = zeroPlot ? zeroPlot.minPos : Math.min(...xs);
-    const maxX = Math.max(...xs);
+    const minReal = Math.min(...xs);
+    const maxReal = Math.max(...xs);
     const ticks = [];
-    for (let k = Math.floor(Math.log10(minReal)); k <= Math.ceil(Math.log10(maxX)); k++) ticks.push(Math.pow(10, k));
+    for (let k = Math.floor(Math.log10(minReal)); k <= Math.ceil(Math.log10(maxReal)); k++) {
+      ticks.push(Math.pow(10, k));
+    }
     return zeroPlot ? [zeroPlot.pseudoX, ...ticks] : ticks;
-  }, [mergedChart, zeroPlot]);
+  }, [chartPoints, zeroPlot]);
 
   // ---- Quant table CSV download ----
   const exportCSV = useCallback(() => {
@@ -2808,10 +2813,15 @@ function App() {
 
     const finiteX = chartPoints.map((d) => d.x).filter((x) => Number.isFinite(x) && x > 0);
     if (finiteX.length === 0) return;
-    const xMin = Math.min(...finiteX) * 0.3;
+    const minReal = Math.min(...finiteX);
+    const xMin = minReal * 0.3;
     const xMax = Math.max(...finiteX) * 3;
-    const lo = Math.log10(Math.max(1e-6, xMin));
+    // Decorative zero-protein control: one decade below the smallest data point.
+    const zeroCtrl = chartPoints.find((d) => Number.isFinite(d.x) && d.x === 0);
+    const pseudoZeroX = zeroCtrl ? Math.pow(10, Math.floor(Math.log10(minReal)) - 1) : null;
+    let lo = Math.log10(Math.max(1e-6, xMin));
     const hi = Math.log10(Math.max(xMax, lo + 0.1));
+    if (pseudoZeroX) lo = Math.min(lo, Math.log10(pseudoZeroX) - 0.15);
     const xToPx = (x) => PAD.left + ((Math.log10(x) - lo) / (hi - lo)) * plotW;
     const span = Math.max(1e-9, fit.Bmax - fit.bottom);
     const yT = (y) => (normFit ? (y - fit.bottom) / span : y);
@@ -2958,6 +2968,30 @@ function App() {
       const py = yToPx(yT(p.y));
       ctx.beginPath();
       ctx.arc(px, py, 5, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.stroke();
+    }
+
+    // Decorative zero-protein control: "0" tick + label at the left edge, plus its data point.
+    if (pseudoZeroX && zeroCtrl) {
+      const zpx = xToPx(pseudoZeroX);
+      // tick mark
+      ctx.strokeStyle = '#1a1816';
+      ctx.lineWidth = 1.25;
+      ctx.beginPath(); ctx.moveTo(zpx, PAD.top + plotH); ctx.lineTo(zpx, PAD.top + plotH + 5); ctx.stroke();
+      // "0" label
+      ctx.fillStyle = '#1a1816';
+      ctx.font = 'bold 11px Helvetica, Arial, sans-serif';
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'top';
+      ctx.fillText('0', zpx, PAD.top + plotH + 9);
+      // zero-control data point
+      ctx.fillStyle = '#b91c1c';
+      ctx.strokeStyle = '#1a1816';
+      ctx.lineWidth = 1;
+      const zpy = yToPx(yT(zeroCtrl.y));
+      ctx.beginPath();
+      ctx.arc(zpx, zpy, 5, 0, Math.PI * 2);
       ctx.fill();
       ctx.stroke();
     }
@@ -3812,11 +3846,16 @@ footer.app-footer .fin { font-family: 'Instrument Serif', serif; font-style: ita
                               type="number"
                               dataKey="x"
                               scale="log"
-                              domain={[zeroPlot ? zeroPlot.pseudoX / 1.6 : "auto", "auto"]}
+                              domain={[zeroPlot ? zeroPlot.pseudoX : "auto", "auto"]}
                               ticks={xTicks}
                               tick={{ fontFamily: "JetBrains Mono", fontSize: 11, fill: "var(--ink-2)" }}
                               stroke="var(--ink)"
-                              tickFormatter={(v) => (zeroPlot && Math.abs(v - zeroPlot.pseudoX) <= zeroPlot.pseudoX * 1e-6) ? "0" : (v >= 100 || v < 0.01 ? v.toExponential(0) : v)}
+                              tickFormatter={(v) => {
+                                if (zeroPlot && Math.abs(v - zeroPlot.pseudoX) <= zeroPlot.pseudoX * 1e-6) return "0";
+                                if (v >= 1000) return `${v / 1000}k`;
+                                if (v < 0.01) return v.toExponential(0);
+                                return String(v);
+                              }}
                               label={{
                                 value: `[Protein] (${concUnit})`,
                                 position: "insideBottom",
@@ -3825,7 +3864,7 @@ footer.app-footer .fin { font-family: 'Instrument Serif', serif; font-style: ita
                               }}
                             />
                             <YAxis
-                              domain={[0, "auto"]}
+                              domain={[0, 1]}
                               tick={{ fontFamily: "JetBrains Mono", fontSize: 11, fill: "var(--ink-2)" }}
                               stroke="var(--ink)"
                               label={{
