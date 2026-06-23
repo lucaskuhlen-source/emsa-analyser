@@ -2208,8 +2208,8 @@ function App() {
   const [bgLambda, setBgLambda] = useState(1e5);        // ALS smoothness/stiffness
   const [bgAsym, setBgAsym] = useState(0.01);           // ALS asymmetry (peak rejection)
   const [rbOn, setRbOn] = useState(true);               // global rolling-ball (paraboloid) subtraction (on by default)
-  const [rbRadius, setRbRadius] = useState(200);        // rolling-ball radius (px), live slider value
-  const [rbRadiusApplied, setRbRadiusApplied] = useState(200); // debounced radius that drives the heavy recompute
+  const [rbRadius, setRbRadius] = useState(100);        // rolling-ball radius (px), live slider value
+  const [rbRadiusApplied, setRbRadiusApplied] = useState(100); // debounced radius that drives the heavy recompute
   const [qcLane, setQcLane] = useState(null);           // lane index shown in the background QC panel
   const [excludeRegions, setExcludeRegions] = useState([]);
   const [labelOffsetBound, setLabelOffsetBound] = useState(0); // px offset for bound label in export
@@ -2634,16 +2634,29 @@ function App() {
     const zero = chartPoints.find((d) => Number.isFinite(d.x) && d.x === 0);
     if (!zero || pos.length === 0) return null;
     const minPos = pos[0].x;
-    // Anchor the "0" marker one full decade below the smallest decade tick so it
-    // sits on the log grid cleanly and never distorts decade tick spacing.
-    const pseudoX = Math.pow(10, Math.floor(Math.log10(minPos)) - 1);
-    return { pseudoX, y: zero.y, label: zero.label, minPos };
-  }, [fit, chartPoints]);
+    // Place the "0" marker (no-protein control) at the concentration where the
+    // displayed curve reaches 1% binding — i.e. the left edge of the meaningful
+    // range. Labelled "0" but positioned so the plot doesn't waste a decade of
+    // empty space on the left. Curve is monotonic, so bisect for shape/model = 0.01.
+    const fn = normFit ? fit.shape : fit.model;
+    const target = normFit ? 0.01 : fit.bottom + 0.01 * Math.max(1e-9, fit.Bmax - fit.bottom);
+    let loX = minPos, hiX = minPos, guard = 0;
+    // bracket the root: search down if minPos is already >1%, up if it's <1%
+    if (fn(minPos) > target) { while (fn(loX) > target && loX > 1e-6 && guard++ < 80) loX /= 1.5; }
+    else { while (fn(hiX) < target && guard++ < 80) hiX *= 1.5; }
+    for (let i = 0; i < 80; i++) {
+      const mid = Math.sqrt(loX * hiX);
+      if (fn(mid) > target) hiX = mid; else loX = mid;
+    }
+    const x01 = Math.max(1e-6, Math.sqrt(loX * hiX));
+    return { pseudoX: x01, y: zero.y, label: zero.label, minPos };
+  }, [fit, chartPoints, normFit]);
 
   const mergedChart = useMemo(() => {
     const span = fit ? Math.max(1e-9, fit.Bmax - fit.bottom) : 1;
-    const yT = (y) => (normFit && fit ? (y - fit.bottom) / span : y);
-    const pts = [...fitCurve.map((p) => ({ ...p }))];
+    const clamp01 = (v) => (Number.isFinite(v) ? Math.max(0, Math.min(1, v)) : null);
+    const yT = (y) => clamp01(normFit && fit ? (y - fit.bottom) / span : y);
+    const pts = [...fitCurve.map((p) => ({ ...p, fit: clamp01(p.fit) }))];
     for (const p of chartPoints) {
       if (!Number.isFinite(p.x) || p.x <= 0) continue;
       pts.push({ x: p.x, y: yT(p.y), label: p.label });
@@ -2652,15 +2665,16 @@ function App() {
     return pts.sort((a, b) => a.x - b.x);
   }, [fitCurve, chartPoints, fit, normFit, zeroPlot]);
 
-  // Clean decade ticks across the real data range, plus the decorative "0" tick.
+  // Decade ticks across the data range; the x01 anchor is added as the "0" tick.
   const xTicks = useMemo(() => {
     const xs = chartPoints.map((p) => p.x).filter((x) => Number.isFinite(x) && x > 0);
     if (!xs.length) return undefined;
-    const minReal = Math.min(...xs);
+    const lo = zeroPlot ? zeroPlot.pseudoX : Math.min(...xs);
     const maxReal = Math.max(...xs);
     const ticks = [];
-    for (let k = Math.floor(Math.log10(minReal)); k <= Math.ceil(Math.log10(maxReal)); k++) {
-      ticks.push(Math.pow(10, k));
+    for (let k = Math.ceil(Math.log10(lo)); k <= Math.ceil(Math.log10(maxReal)); k++) {
+      const t = Math.pow(10, k);
+      if (t > lo * 1.0001) ticks.push(t);  // keep decades clear of the "0" anchor
     }
     return zeroPlot ? [zeroPlot.pseudoX, ...ticks] : ticks;
   }, [chartPoints, zeroPlot]);
@@ -2814,14 +2828,22 @@ function App() {
     const finiteX = chartPoints.map((d) => d.x).filter((x) => Number.isFinite(x) && x > 0);
     if (finiteX.length === 0) return;
     const minReal = Math.min(...finiteX);
-    const xMin = minReal * 0.3;
     const xMax = Math.max(...finiteX) * 3;
-    // Decorative zero-protein control: one decade below the smallest data point.
+    // Zero-protein control placed at x01: the conc where the displayed curve hits 1% binding.
     const zeroCtrl = chartPoints.find((d) => Number.isFinite(d.x) && d.x === 0);
-    const pseudoZeroX = zeroCtrl ? Math.pow(10, Math.floor(Math.log10(minReal)) - 1) : null;
+    let pseudoZeroX = null;
+    if (zeroCtrl) {
+      const fn = normFit ? fit.shape : fit.model;
+      const target = normFit ? 0.01 : fit.bottom + 0.01 * Math.max(1e-9, fit.Bmax - fit.bottom);
+      let loX = minReal, hiX = minReal, guard = 0;
+      if (fn(minReal) > target) { while (fn(loX) > target && loX > 1e-6 && guard++ < 80) loX /= 1.5; }
+      else { while (fn(hiX) < target && guard++ < 80) hiX *= 1.5; }
+      for (let i = 0; i < 80; i++) { const mid = Math.sqrt(loX * hiX); if (fn(mid) > target) hiX = mid; else loX = mid; }
+      pseudoZeroX = Math.max(1e-6, Math.sqrt(loX * hiX));
+    }
+    const xMin = pseudoZeroX ? pseudoZeroX : minReal * 0.3;
     let lo = Math.log10(Math.max(1e-6, xMin));
     const hi = Math.log10(Math.max(xMax, lo + 0.1));
-    if (pseudoZeroX) lo = Math.min(lo, Math.log10(pseudoZeroX) - 0.15);
     const xToPx = (x) => PAD.left + ((Math.log10(x) - lo) / (hi - lo)) * plotW;
     const span = Math.max(1e-9, fit.Bmax - fit.bottom);
     const yT = (y) => (normFit ? (y - fit.bottom) / span : y);
@@ -2885,6 +2907,7 @@ function App() {
         const xVal = m * Math.pow(10, k);
         const lv = Math.log10(xVal);
         if (lv < lo - 0.01 || lv > hi + 0.01) continue;
+        if (pseudoZeroX && xVal <= pseudoZeroX * 1.0001) continue;  // "0" anchor owns the left edge
         const px = xToPx(xVal);
         if (px < PAD.left - 1 || px > PAD.left + plotW + 1) continue;
 
@@ -3865,6 +3888,9 @@ footer.app-footer .fin { font-family: 'Instrument Serif', serif; font-style: ita
                             />
                             <YAxis
                               domain={[0, 1]}
+                              allowDataOverflow={true}
+                              ticks={[0, 0.2, 0.4, 0.6, 0.8, 1]}
+                              tickFormatter={(v) => v.toFixed(1)}
                               tick={{ fontFamily: "JetBrains Mono", fontSize: 11, fill: "var(--ink-2)" }}
                               stroke="var(--ink)"
                               label={{
