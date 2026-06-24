@@ -3979,7 +3979,7 @@ footer.app-footer .fin { align-self: flex-end; }
               <span>BOUND &amp; FREE — a binding-curve workbench</span>
               <span className="footer-about">
                 A binding-curve workbench for EMSA Kd estimation · MIT-licensed ·{" "}
-                <a href="https://github.com/lucas-kuhlen/emsa-analyser" target="_blank" rel="noopener noreferrer">GitHub</a>
+                <a href="https://github.com/lucaskuhlen-source/emsa-analyser" target="_blank" rel="noopener noreferrer">GitHub</a>
               </span>
               <span className="footer-cite">Cite: Kuhlen, L. (2026). Bound &amp; Free. emsa-analyzer.com</span>
             </div>
