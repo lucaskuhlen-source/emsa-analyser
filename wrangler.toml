@@ -11,7 +11,7 @@
 #
 # The custom domain (emsa-analyzer.com) attaches to the Worker as before — unchanged.
 
-name = "emsa-analyzer"
+name = "emsa-analyser"
 main = "worker.js"
 compatibility_date = "2024-11-01"
 
