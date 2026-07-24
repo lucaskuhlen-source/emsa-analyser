@@ -25,6 +25,35 @@ Enter the protein concentration for each lane
 Fit and read off Kd
 
 
+Tabs
+
+EMSA analysis — quantify a single gel and fit its binding curve (the workflow above).
+Overlay — overlay multiple titrations on one normalised axis to compare Kd values. Use “Add to overlay” on the analysis tab, or drop exported CSVs.
+Triplicate — combine replicate titrations of the same interaction. Each replicate is Hill-fit independently; the reported Kd is the geometric mean of the replicate fits with a 95% CI built across replicates (log space, t-distribution). When all replicates share a concentration grid, per-point mean ± SEM is shown; otherwise a Kd range is reported. %CV summarises run-to-run reproducibility. Use “Add to triplicate” on the analysis tab, or drop exported CSVs.
+
+
+Develop and build
+
+Requires Node 18+.
+
+    npm install      # install dependencies
+    npm run dev      # Vite dev server
+    npm run build    # production build -> ./dist
+    npm run preview  # serve the built ./dist locally
+
+The app is entirely client-side (image processing, curve fitting and statistics all run
+in the browser). Source is split into src/lib/emsa (logic: image IO, image processing,
+curve fitting, CSV, stats) and src/components/emsa (React UI).
+
+
+Deploy (Cloudflare Worker)
+
+The build output in ./dist is served by a Worker (worker.js) via the static-assets
+binding declared in wrangler.toml. Deploy as a Worker (Workers & Pages → Create → Workers
+→ “Import a repository”), with build command `npm run build` and deploy command
+`npx wrangler deploy`.
+
+
 How to cite
 
 

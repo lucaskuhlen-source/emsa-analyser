@@ -3,34 +3,15 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>EMSA Analyzer</title>
+  <title>EMSA Analyzer — Bound &amp; Free</title>
+  <meta name="description" content="Browser-based EMSA binding-curve workbench: lane detection, band integration, Kd fitting, multi-curve overlay, and replicate statistics." />
   <style>
-    html, body { margin: 0; padding: 0; }
-    #loading { font-family: system-ui, sans-serif; color: #666; padding: 2rem; }
+    html, body { margin: 0; padding: 0; background: #f4ede0; }
+    #loading { font-family: system-ui, sans-serif; color: #8a8275; padding: 2rem; }
   </style>
-
-  <!-- Map bare module names to CDN ESM builds. esm.sh resolves transitive deps;
-       ?external=react,react-dom keeps a single React instance (avoids hook errors). -->
-  <script type="importmap">
-  {
-    "imports": {
-      "react": "https://esm.sh/react@18.3.1",
-      "react-dom": "https://esm.sh/react-dom@18.3.1?external=react",
-      "react-dom/client": "https://esm.sh/react-dom@18.3.1/client?external=react",
-      "recharts": "https://esm.sh/recharts@2.12.7?external=react,react-dom",
-      "lucide-react": "https://esm.sh/lucide-react@0.383.0?external=react"
-    }
-  }
-  </script>
-
-  <!-- Babel transpiles the JSX in the browser. No build step. -->
-  <script src="https://unpkg.com/@babel/standalone@7.25.6/babel.min.js"></script>
 </head>
 <body>
   <div id="root"><div id="loading">Loading EMSA Analyzer…</div></div>
-
-  <!-- data-type="module" makes Babel emit an ES module, so the import map above
-       resolves react/recharts/lucide-react. The mount call lives at the end of app.jsx. -->
-  <script type="text/babel" data-type="module" data-presets="react" src="app.jsx"></script>
+  <script type="module" src="/src/main.jsx"></script>
 </body>
 </html>

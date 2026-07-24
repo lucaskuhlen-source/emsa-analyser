@@ -1,0 +1,21 @@
+# Cloudflare WORKER configuration for the EMSA Analyzer.
+#
+# Deploy as a WORKER (Workers & Pages -> Create -> Workers -> "Import a repository"),
+# NOT via the Pages flow. The Worker (worker.js) serves the built static site from the
+# ASSETS binding; there is no backend/API.
+#
+# Build settings (Worker -> Settings -> Build):
+#   Root directory:   the folder containing this file (package.json)
+#   Build command:    npm run build        (produces ./dist)
+#   Deploy command:   npx wrangler deploy   (usually the default)
+#
+# The custom domain (emsa-analyzer.com) attaches to the Worker as before — unchanged.
+
+name = "emsa-analyzer"
+main = "worker.js"
+compatibility_date = "2024-11-01"
+
+[assets]
+directory = "./dist"
+binding = "ASSETS"
+not_found_handling = "single-page-application"
