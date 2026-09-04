@@ -4,6 +4,7 @@ import { Upload, Wand2, RotateCcw, Minus, Beaker, ArrowRight, Activity, Crop, Sc
 import { decodeFile } from '@/lib/emsa/imageIO';
 import { bilinear, buildWorkBuffer, findGelROI, columnProfile, smooth, findPeaks, laneProfile, alsBaseline, integrateBox, rollingBallBackground } from '@/lib/emsa/imageProcessing';
 import { nelderMead, fitBinding, bootstrapKd } from '@/lib/emsa/curveFit';
+import { logXWindow, logXTicks } from '@/lib/emsa/plotScale';
 import { fmt } from '@/lib/emsa/format';
 import { SectionHead } from './SectionHead';
 import { ImageOverlay } from './ImageOverlay';
@@ -25,6 +26,16 @@ export function AnalyzerApp({ onAddToOverlay, onAddToTriplicate }) {
   const [concs, setConcs] = useState([]);
   const [concUnit, setConcUnit] = useState("nM");
   const [fitModel, setFitModel] = useState("hill"); // 'hyperbolic' | 'hill' | 'quadratic'
+  // How the fraction bound is derived from the two band windows:
+  //   'ratio'     — f = bound/(bound+free). Internally normalised per lane, so it tolerates
+  //                 uneven loading, but it ASSUMES the label's quantum yield is the same in
+  //                 the free and bound bands.
+  //   'depletion' — f = 1 − free/free(ref). Reads only the disappearance of the free probe,
+  //                 so it is immune to fluorescence enhancement/quenching on complex
+  //                 formation (and to smeared/super-shifted complexes), but it assumes equal
+  //                 probe loading in every lane.
+  const [quantMode, setQuantMode] = useState("ratio"); // 'ratio' | 'depletion'
+  const [refLane, setRefLane] = useState("auto");      // free-DNA reference lane ('auto' = lowest [P])
   const [normFit, setNormFit] = useState(true); // display specific binding normalised 0→1 (vs raw with offset)
   const [dnaConc, setDnaConc] = useState(""); // [DNA] substrate, experiment-wide, for tight-binding
   const [toolMode, setToolMode] = useState(null);   // null | 'crop' (destructive) | 'emsa' (ROI) | 'exclude'
@@ -294,7 +305,29 @@ export function AnalyzerApp({ onAddToOverlay, onAddToTriplicate }) {
     return out;
   }, [signalData, rbBackground]);
 
-  const quant = useMemo(() => {
+  const depletion = quantMode === "depletion";
+
+  // Which lane defines "100% free probe" for depletion quantification. Auto = the lowest
+  // entered [protein] (i.e. the no-protein control when there is one); falls back to the
+  // first lane while concentrations are still blank.
+  const refLaneIdx = useMemo(() => {
+    if (lanes.length === 0) return null;
+    if (refLane !== "auto") {
+      const i = Number(refLane);
+      return Number.isInteger(i) && i >= 0 && i < lanes.length ? i : 0;
+    }
+    let best = null, bestC = Infinity;
+    lanes.forEach((_, i) => {
+      const c = parseFloat(concs[i]);
+      if (Number.isFinite(c) && c < bestC) { bestC = c; best = i; }
+    });
+    return best ?? 0;
+  }, [lanes, concs, refLane]);
+
+  // Heavy pass: ALS baseline + band integration per lane. Deliberately independent of the
+  // fraction definition and of the entered concentrations, so switching quantification mode
+  // or typing a concentration never re-integrates the gel.
+  const laneIntegrals = useMemo(() => {
     if (!signalData || !correctedSig || !bands || lanes.length === 0 || !roi) return null;
     const W = signalData.W;
     const sig = correctedSig;
@@ -331,25 +364,35 @@ export function AnalyzerApp({ onAddToOverlay, onAddToTriplicate }) {
       const Ib = integrateBox(rowSum, counts, baseline, roi.y, bTop, bBot);
       const If = integrateBox(rowSum, counts, baseline, roi.y, fTop, fBot);
 
-      // Keep the signed nets in the table (useful QC), but compute the fraction from the
-      // non-negative parts: a negative net just means "below baseline = none here", so
-      // f = bound⁺/(bound⁺+free⁺) is mathematically pinned to [0,1] by construction.
+      // Keep the signed nets in the table (useful QC), but derive the fraction from the
+      // non-negative parts: a negative net just means "below baseline = none here", which
+      // keeps both fraction definitions pinned to [0,1] by construction.
       const bNet = Ib.net;
       const fNet = If.net;
-      const total = bNet + fNet;
-      const bPos = Math.max(0, bNet);
-      const fPos = Math.max(0, fNet);
-      const denom = bPos + fPos;
-      const fbound = denom > 0 ? bPos / denom : 0;
       return {
         label: l.label,
         bound: bNet,
         free: fNet,
-        total,
-        fbound,
+        total: bNet + fNet,
+        bPos: Math.max(0, bNet),
+        fPos: Math.max(0, fNet),
       };
     });
   }, [signalData, correctedSig, bands, lanes, laneWidth, roi, excludeRegions, bgSubtract, bgLambda, bgAsym]);
+
+  // Cheap pass: turn the integrals into a fraction bound. The depletion fraction is relative,
+  // so it needs the reference lane's free signal — known only once every lane is integrated.
+  const quant = useMemo(() => {
+    if (!laneIntegrals) return null;
+    const refFree = refLaneIdx != null && laneIntegrals[refLaneIdx] ? laneIntegrals[refLaneIdx].fPos : 0;
+    return laneIntegrals.map((r) => {
+      const freeFrac = refFree > 0 ? r.fPos / refFree : NaN;
+      const fbound = depletion
+        ? (Number.isFinite(freeFrac) ? Math.max(0, Math.min(1, 1 - freeFrac)) : 0)
+        : (r.bPos + r.fPos > 0 ? r.bPos / (r.bPos + r.fPos) : 0);
+      return { label: r.label, bound: r.bound, free: r.free, total: r.total, freeFrac, fbound };
+    });
+  }, [laneIntegrals, depletion, refLaneIdx]);
 
   // Data for the per-lane background QC panel (the selected lane's density trace, the ALS
   // baseline fit under it, the pre-rolling-ball trace for reference, and the band windows).
@@ -433,48 +476,33 @@ export function AnalyzerApp({ onAddToOverlay, onAddToTriplicate }) {
     }));
   }, [quant, concs]);
 
+  // Shared log-X window for the isotherm — used by the screen chart AND the PNG export, so
+  // the download is a faithful copy of what was reviewed. See lib/emsa/plotScale.js.
+  const xScale = useMemo(
+    () => logXWindow(
+      chartPoints.map((d) => d.x),
+      chartPoints.some((d) => Number.isFinite(d.x) && d.x === 0)
+    ),
+    [chartPoints]
+  );
+
   const fitCurve = useMemo(() => {
-    if (!fit) return [];
-    const finiteX = chartPoints.map((d) => d.x).filter((x) => Number.isFinite(x) && x > 0);
-    if (finiteX.length === 0) return [];
-    const minX = Math.min(...finiteX) * 0.3;
-    const maxX = Math.max(...finiteX) * 3;
-    const lo = Math.log10(Math.max(1e-6, minX));
-    const hi = Math.log10(Math.max(maxX, lo + 0.1));
+    if (!fit || !xScale) return [];
+    const { lo, hi } = xScale;
     const pts = [];
     for (let i = 0; i <= 100; i++) {
       const x = Math.pow(10, lo + ((hi - lo) * i) / 100);
       pts.push({ x, fit: normFit ? fit.shape(x) : fit.model(x) });
     }
     return pts;
-  }, [fit, chartPoints, normFit]);
+  }, [fit, xScale, normFit]);
 
-  // Prism-style zero: a no-protein control can't sit on a log axis, so place it one
-  // data-step left of the smallest real concentration and label that tick "0".
-  // Presentation only — the fit and curve are unchanged.
   const zeroPlot = useMemo(() => {
-    if (!fit) return null;
-    const pos = chartPoints.filter((d) => Number.isFinite(d.x) && d.x > 0).sort((a, b) => a.x - b.x);
+    if (!xScale || xScale.pseudoX == null) return null;
     const zero = chartPoints.find((d) => Number.isFinite(d.x) && d.x === 0);
-    if (!zero || pos.length === 0) return null;
-    const minPos = pos[0].x;
-    // Place the "0" marker (no-protein control) at the concentration where the
-    // displayed curve reaches 1% binding — i.e. the left edge of the meaningful
-    // range. Labelled "0" but positioned so the plot doesn't waste a decade of
-    // empty space on the left. Curve is monotonic, so bisect for shape/model = 0.01.
-    const fn = normFit ? fit.shape : fit.model;
-    const target = normFit ? 0.01 : fit.bottom + 0.01 * Math.max(1e-9, fit.Bmax - fit.bottom);
-    let loX = minPos, hiX = minPos, guard = 0;
-    // bracket the root: search down if minPos is already >1%, up if it's <1%
-    if (fn(minPos) > target) { while (fn(loX) > target && loX > 1e-6 && guard++ < 80) loX /= 1.5; }
-    else { while (fn(hiX) < target && guard++ < 80) hiX *= 1.5; }
-    for (let i = 0; i < 80; i++) {
-      const mid = Math.sqrt(loX * hiX);
-      if (fn(mid) > target) hiX = mid; else loX = mid;
-    }
-    const x01 = Math.max(1e-6, Math.sqrt(loX * hiX));
-    return { pseudoX: x01, y: zero.y, label: zero.label, minPos };
-  }, [fit, chartPoints, normFit]);
+    if (!zero) return null;
+    return { pseudoX: xScale.pseudoX, y: zero.y, label: zero.label, minPos: xScale.minPos };
+  }, [xScale, chartPoints]);
 
   const mergedChart = useMemo(() => {
     const span = fit ? Math.max(1e-9, fit.Bmax - fit.bottom) : 1;
@@ -489,29 +517,19 @@ export function AnalyzerApp({ onAddToOverlay, onAddToTriplicate }) {
     return pts.sort((a, b) => a.x - b.x);
   }, [fitCurve, chartPoints, fit, normFit, zeroPlot]);
 
-  // Decade ticks across the data range; the x01 anchor is added as the "0" tick.
-  const xTicks = useMemo(() => {
-    const xs = chartPoints.map((p) => p.x).filter((x) => Number.isFinite(x) && x > 0);
-    if (!xs.length) return undefined;
-    const lo = zeroPlot ? zeroPlot.pseudoX : Math.min(...xs);
-    const maxReal = Math.max(...xs);
-    const ticks = [];
-    for (let k = Math.ceil(Math.log10(lo)); k <= Math.ceil(Math.log10(maxReal)); k++) {
-      const t = Math.pow(10, k);
-      if (t > lo * 1.0001) ticks.push(t);  // keep decades clear of the "0" anchor
-    }
-    return zeroPlot ? [zeroPlot.pseudoX, ...ticks] : ticks;
-  }, [chartPoints, zeroPlot]);
+  const xTicks = useMemo(() => (xScale ? logXTicks(xScale) : undefined), [xScale]);
 
   // ---- Quant table CSV download ----
   const buildCSV = useCallback(() => {
     if (!quant) return null;
-    const rows = [["lane", `[protein]_${concUnit}`, "bound", "free", "total", "fraction_bound"]];
+    const rows = [["lane", `[protein]_${concUnit}`, "bound", "free", "total", ...(depletion ? ["free_over_free_ref"] : []), "fraction_bound"]];
     quant.forEach((q, i) =>
-      rows.push([q.label, concs[i] ?? "", q.bound, q.free, q.total, q.fbound])
+      rows.push([q.label, concs[i] ?? "", q.bound, q.free, q.total, ...(depletion ? [q.freeFrac] : []), q.fbound])
     );
     if (fit) {
       rows.push([]);
+      rows.push(["# quantification", depletion ? "free_depletion: f = 1 - free/free(ref)" : "ratio: f = bound/(bound+free)"]);
+      if (depletion) rows.push(["# free_reference_lane", lanes[refLaneIdx]?.label ?? ""]);
       rows.push(["# model", fitModel]);
       rows.push(["# Kd", fit.Kd, concUnit]);
       if (fitCI) {
@@ -535,7 +553,7 @@ export function AnalyzerApp({ onAddToOverlay, onAddToTriplicate }) {
           .join(",")
       )
       .join("\n");
-  }, [quant, concs, concUnit, fit, fitCI, fitModel, dnaConc]);
+  }, [quant, concs, concUnit, fit, fitCI, fitModel, dnaConc, depletion, lanes, refLaneIdx]);
 
   // ---- CSV download (uses buildCSV) ----
   const exportCSV = useCallback(() => {
@@ -675,25 +693,10 @@ export function AnalyzerApp({ onAddToOverlay, onAddToTriplicate }) {
     const plotW = W - PAD.left - PAD.right;
     const plotH = H - PAD.top - PAD.bottom;
 
-    const finiteX = chartPoints.map((d) => d.x).filter((x) => Number.isFinite(x) && x > 0);
-    if (finiteX.length === 0) return;
-    const minReal = Math.min(...finiteX);
-    const xMax = Math.max(...finiteX) * 3;
-    // Zero-protein control placed at x01: the conc where the displayed curve hits 1% binding.
-    const zeroCtrl = chartPoints.find((d) => Number.isFinite(d.x) && d.x === 0);
-    let pseudoZeroX = null;
-    if (zeroCtrl) {
-      const fn = normFit ? fit.shape : fit.model;
-      const target = normFit ? 0.01 : fit.bottom + 0.01 * Math.max(1e-9, fit.Bmax - fit.bottom);
-      let loX = minReal, hiX = minReal, guard = 0;
-      if (fn(minReal) > target) { while (fn(loX) > target && loX > 1e-6 && guard++ < 80) loX /= 1.5; }
-      else { while (fn(hiX) < target && guard++ < 80) hiX *= 1.5; }
-      for (let i = 0; i < 80; i++) { const mid = Math.sqrt(loX * hiX); if (fn(mid) > target) hiX = mid; else loX = mid; }
-      pseudoZeroX = Math.max(1e-6, Math.sqrt(loX * hiX));
-    }
-    const xMin = pseudoZeroX ? pseudoZeroX : minReal * 0.3;
-    let lo = Math.log10(Math.max(1e-6, xMin));
-    const hi = Math.log10(Math.max(xMax, lo + 0.1));
+    if (!xScale) return;
+    // Same window as the on-screen chart, so the PNG is a faithful copy of what was reviewed.
+    const { lo, hi, pseudoX: pseudoZeroX } = xScale;
+    const zeroCtrl = pseudoZeroX ? chartPoints.find((d) => Number.isFinite(d.x) && d.x === 0) : null;
     const xToPx = (x) => PAD.left + ((Math.log10(x) - lo) / (hi - lo)) * plotW;
     const span = Math.max(1e-9, fit.Bmax - fit.bottom);
     const yT = (y) => (normFit ? (y - fit.bottom) / span : y);
@@ -718,7 +721,7 @@ export function AnalyzerApp({ onAddToOverlay, onAddToTriplicate }) {
     ctx.fillText('Binding isotherm', PAD.left, 32);
     ctx.font = 'bold 11px Helvetica, Arial, sans-serif';
     ctx.fillStyle = '#4a453d';
-    ctx.fillText('fraction bound vs. [protein]', PAD.left, 48);
+    ctx.fillText(depletion ? 'fraction bound (free-DNA depletion) vs. [protein]' : 'fraction bound vs. [protein]', PAD.left, 48);
 
     // Plot area background
     ctx.fillStyle = '#ffffff';
@@ -757,7 +760,7 @@ export function AnalyzerApp({ onAddToOverlay, onAddToTriplicate }) {
         const xVal = m * Math.pow(10, k);
         const lv = Math.log10(xVal);
         if (lv < lo - 0.01 || lv > hi + 0.01) continue;
-        if (pseudoZeroX && xVal <= pseudoZeroX * 1.0001) continue;  // "0" anchor owns the left edge
+        if (pseudoZeroX && xVal <= pseudoZeroX * 1.08) continue;  // "0" anchor owns the left edge
         const px = xToPx(xVal);
         if (px < PAD.left - 1 || px > PAD.left + plotW + 1) continue;
 
@@ -879,7 +882,7 @@ export function AnalyzerApp({ onAddToOverlay, onAddToTriplicate }) {
     ctx.translate(18, PAD.top + plotH / 2);
     ctx.rotate(-Math.PI / 2);
     ctx.textAlign = 'center';
-    ctx.fillText(normFit ? 'specific binding (normalised)' : 'fraction bound', 0, 0);
+    ctx.fillText(normFit ? 'specific binding (normalised)' : depletion ? 'fraction bound (1 − free/free₀)' : 'fraction bound', 0, 0);
     ctx.restore();
 
     // Stats footer
@@ -891,11 +894,15 @@ export function AnalyzerApp({ onAddToOverlay, onAddToTriplicate }) {
       : fitModel === "quadratic" ? "tight-binding" : "hyperbolic";
     const stats = `Kd = ${fmt(fit.Kd, 3)} ${concUnit}  ·  top = ${fmt(fit.Bmax, 3)}  ·  bottom = ${fmt(fit.bottom, 3)}  ·  R² = ${fmt(fit.r2, 3)}  ·  ${modelLabel}`;
     ctx.fillText(stats, W - PAD.right, 32);
-    if (fitCI) {
-      ctx.font = '10px Helvetica, Arial, sans-serif';
-      ctx.fillStyle = '#57534e';
-      ctx.fillText(`Kd 95% CI [${fmt(fitCI.kdLo, 3)}, ${fmt(fitCI.kdHi, 3)}] ${concUnit} · single-gel fit`, W - PAD.right, 46);
-    }
+    ctx.font = '10px Helvetica, Arial, sans-serif';
+    ctx.fillStyle = '#57534e';
+    const methodLabel = depletion ? 'f = 1 − free/free₀' : 'f = bound/(bound+free)';
+    ctx.fillText(
+      fitCI
+        ? `Kd 95% CI [${fmt(fitCI.kdLo, 3)}, ${fmt(fitCI.kdHi, 3)}] ${concUnit} · single-gel fit · ${methodLabel}`
+        : methodLabel,
+      W - PAD.right, 46
+    );
 
     // Download via data: URL
     canvas.toBlob((blob) => {
@@ -908,7 +915,7 @@ export function AnalyzerApp({ onAddToOverlay, onAddToTriplicate }) {
       };
       reader.readAsDataURL(blob);
     }, 'image/png');
-  }, [fit, chartPoints, concUnit, fitModel, normFit, fitCI]);
+  }, [fit, chartPoints, xScale, concUnit, fitModel, normFit, fitCI, depletion]);
 
   const reset = () => {
     setImgSrc(null);
@@ -1114,12 +1121,12 @@ footer.app-footer .fin { align-self: flex-end; }
           <header>
             <div className="masthead">
               <div>
-                <div className="small-caps">electrophoretic mobility shift assay · vol. i</div>
+                <div className="small-caps">electrophoretic mobility shift assay · vol. ii</div>
                 <h1>Bound <em>&amp;</em> Free</h1>
                 <div className="tag">a binding-curve workbench</div>
               </div>
               <div className="meta">
-                <div className="date">v1.16</div>
+                <div className="date">v2.1</div>
                 <div className="meta-tag">Kd by least-squares</div>
               </div>
             </div>
@@ -1170,7 +1177,7 @@ footer.app-footer .fin { align-self: flex-end; }
                 {[
                   ["01", "We invert luminance", "so dark bands become positive signal. 16-bit TIFF is read at full depth for the cleanest faint-band quantification."],
                   ["02", "Crop, then place by hand", "rotate first if lanes are tilted, draw the crop region, then add lanes by hand (buttons or double-click). Nothing is placed for you on upload."],
-                  ["03", "Per-lane background", "a smooth ALS baseline is fit under each lane and subtracted before integrating density. f bound = bound / (bound + free)."],
+                  ["03", "Two ways to quantify", "a smooth ALS baseline is subtracted per lane before integrating. Then either f = bound/(bound+free), or — when binding changes probe fluorescence — f = 1 − free/free₀ from the free band alone."],
                 ].map(([n, t, d]) => (
                   <div className="callout" key={n}>
                     <div className="num">¶{n}</div>
@@ -1586,6 +1593,23 @@ footer.app-footer .fin { align-self: flex-end; }
                       <div className="panel-head">
                         <Beaker size={13} />
                         <span className="small-caps">per-lane density</span>
+                        <div style={{ flex: 1 }} />
+                        <div style={{ display: "flex", gap: 6 }}>
+                          <button
+                            className={`btn btn-ghost btn-tiny${!depletion ? " btn-primary" : ""}`}
+                            onClick={() => setQuantMode("ratio")}
+                            title="f = bound / (bound + free). Self-normalising per lane, so uneven loading cancels — but it assumes the label is equally bright in the free and bound bands."
+                          >
+                            Bound / total
+                          </button>
+                          <button
+                            className={`btn btn-ghost btn-tiny${depletion ? " btn-primary" : ""}`}
+                            onClick={() => setQuantMode("depletion")}
+                            title="f = 1 − free / free(reference lane). Uses only the loss of the free probe, so it stays correct when complex formation changes fluorescence intensity or the complex smears — but it assumes equal probe loading in every lane."
+                          >
+                            Free depletion
+                          </button>
+                        </div>
                       </div>
                       <div style={{ overflow: "auto", maxHeight: 320 }}>
                         <table className="t">
@@ -1595,21 +1619,58 @@ footer.app-footer .fin { align-self: flex-end; }
                               <th>[P] {concUnit}</th>
                               <th>bound</th>
                               <th>free</th>
+                              {depletion && <th>F/F<sub>0</sub></th>}
                               <th>f<sub>bound</sub></th>
                             </tr>
                           </thead>
                           <tbody>
                             {quant.map((q, i) => (
                               <tr key={i}>
-                                <td>{q.label}</td>
+                                <td>
+                                  {q.label}
+                                  {depletion && i === refLaneIdx && (
+                                    <span style={{ color: "var(--muted)", fontSize: 10 }}> ref</span>
+                                  )}
+                                </td>
                                 <td>{concs[i] === "" || concs[i] == null ? "—" : concs[i]}</td>
-                                <td style={{ color: "var(--accent)" }}>{fmt(q.bound, 2)}</td>
+                                <td style={{ color: depletion ? "var(--muted)" : "var(--accent)" }}>{fmt(q.bound, 2)}</td>
                                 <td style={{ color: "var(--accent-2)" }}>{fmt(q.free, 2)}</td>
+                                {depletion && <td>{Number.isFinite(q.freeFrac) ? fmt(q.freeFrac, 3) : "—"}</td>}
                                 <td>{fmt(q.fbound, 3)}</td>
                               </tr>
                             ))}
                           </tbody>
                         </table>
+                      </div>
+                      <div style={{ padding: "8px 16px 10px", borderTop: "1px solid var(--rule)", fontSize: 10, lineHeight: 1.6, color: "var(--muted)", fontFamily: "'JetBrains Mono', monospace" }}>
+                        {depletion ? (
+                          <>
+                            <div style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 4 }}>
+                              <span>f = 1 − free / free(ref) · reference lane</span>
+                              <select
+                                className="select"
+                                style={{ padding: "1px 4px", fontSize: 10 }}
+                                value={refLane}
+                                onChange={(e) => setRefLane(e.target.value)}
+                                title="Lane taken as 100% free probe. Auto picks the lowest entered [protein]."
+                              >
+                                <option value="auto">auto ({lanes[refLaneIdx]?.label ?? "—"})</option>
+                                {lanes.map((l, i) => (
+                                  <option key={i} value={String(i)}>{l.label}</option>
+                                ))}
+                              </select>
+                            </div>
+                            <div>
+                              bound band is ignored — use this when binding changes probe fluorescence
+                              (or the complex smears). Assumes equal probe loading per lane.
+                            </div>
+                          </>
+                        ) : (
+                          <div>
+                            f = bound / (bound + free) · self-normalising, but assumes equal label
+                            brightness in both bands.
+                          </div>
+                        )}
                       </div>
                     </div>
 
@@ -1704,7 +1765,9 @@ footer.app-footer .fin { align-self: flex-end; }
                       <div className="flex-baseline" style={{ marginBottom: 8 }}>
                         <div>
                           <div className="chart-title">Binding isotherm</div>
-                          <div className="small-caps">fraction bound vs. [protein]</div>
+                          <div className="small-caps">
+                            {depletion ? "fraction bound (free-DNA depletion) vs. [protein]" : "fraction bound vs. [protein]"}
+                          </div>
                         </div>
                         <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
                           <button
@@ -1736,7 +1799,10 @@ footer.app-footer .fin { align-self: flex-end; }
                               type="number"
                               dataKey="x"
                               scale="log"
-                              domain={[zeroPlot ? zeroPlot.pseudoX : "auto", "auto"]}
+                              // Explicit + allowDataOverflow: without it recharts widens the
+                              // domain to swallow every datum, re-opening the dead space.
+                              domain={xScale ? [Math.pow(10, xScale.lo), Math.pow(10, xScale.hi)] : ["auto", "auto"]}
+                              allowDataOverflow={true}
                               ticks={xTicks}
                               tick={{ fontFamily: "JetBrains Mono", fontSize: 11, fill: "var(--ink-2)" }}
                               stroke="var(--ink)"
@@ -1761,7 +1827,7 @@ footer.app-footer .fin { align-self: flex-end; }
                               tick={{ fontFamily: "JetBrains Mono", fontSize: 11, fill: "var(--ink-2)" }}
                               stroke="var(--ink)"
                               label={{
-                                value: normFit ? "Specific binding (norm.)" : "Fraction bound",
+                                value: normFit ? "Specific binding (norm.)" : depletion ? "Fraction bound (1 − free/free₀)" : "Fraction bound",
                                 angle: -90,
                                 position: "insideLeft",
                                 style: { fontFamily: "Instrument Serif", fontStyle: "italic", fontSize: 14, fill: "var(--ink)", textAnchor: "middle" },
@@ -1769,7 +1835,7 @@ footer.app-footer .fin { align-self: flex-end; }
                             />
                             <Tooltip
                               contentStyle={{ background: "var(--paper)", border: "1px solid var(--ink)", fontFamily: "JetBrains Mono", fontSize: 12, color: "var(--ink)" }}
-                              formatter={(v, name) => [Number.isFinite(v) ? v.toFixed(4) : v, name === "fit" ? "model" : "f bound"]}
+                              formatter={(v, name) => [Number.isFinite(v) ? v.toFixed(4) : v, name === "fit" ? "model" : depletion ? "f bound (depletion)" : "f bound"]}
                               labelFormatter={(v) => (zeroPlot && Math.abs(v - zeroPlot.pseudoX) <= zeroPlot.pseudoX * 1e-6) ? `[P] = 0 ${concUnit}` : `[P] = ${Number.isFinite(v) ? v.toPrecision(3) : v} ${concUnit}`}
                             />
                             <ReferenceLine
@@ -1802,6 +1868,9 @@ footer.app-footer .fin { align-self: flex-end; }
                         </ResponsiveContainer>
                       </div>
                       <div style={{ fontSize: 11, color: "var(--ink-2)", fontStyle: "italic", marginTop: 8, fontFamily: "'JetBrains Mono', monospace" }}>
+                        {depletion
+                          ? `f from free-DNA depletion: 1 − free/free(${lanes[refLaneIdx]?.label ?? "ref"}) · `
+                          : `f from band ratio: bound/(bound+free) · `}
                         {normFit
                           ? `Normalised specific binding (f − baseline)/(top − baseline) · baseline = ${fmt(fit.bottom, 3)}, top = ${fmt(fit.Bmax, 3)} · Kd unaffected by normalisation`
                           : `Raw fraction bound · fitted baseline = ${fmt(fit.bottom, 3)} at [P]=0 · top constrained ≤ 1`}

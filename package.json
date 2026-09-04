@@ -1,6 +1,6 @@
 {
   "name": "emsa-analyzer",
-  "version": "1.0.0",
+  "version": "2.1.0",
   "private": true,
   "type": "module",
   "description": "Bound & Free — a browser-based EMSA binding-curve workbench (Kd fitting, overlay, replicate statistics).",
